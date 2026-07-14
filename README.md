@@ -47,7 +47,7 @@
 
 Token 只放 Script Properties，不要寫進程式或 GitHub。
 
-## 3. 部署 Webhook
+## 3. 部署 Apps Script
 
 1. Apps Script 點「部署 → 新部署」。
 2. 類型選「網頁應用程式」。
@@ -55,11 +55,30 @@ Token 只放 Script Properties，不要寫進程式或 GitHub。
 4. 存取權選「所有人」。
 5. 部署後複製 `/exec` 網址。
 6. 如果有設定 `WEBHOOK_SECRET`，在網址後加 `?key=相同字串`。
-7. 把完整網址貼到 LINE Developers → Messaging API → Webhook URL。
-8. 按 Verify，成功後開啟 Use webhook。
-9. 程式修改後需「管理部署 → 編輯 → 新版本」重新部署。
+7. 先保存這個網址，下一節會把它設成 Cloudflare Worker 的 `APPS_SCRIPT_URL`。
+8. 程式修改後需「管理部署 → 編輯 → 新版本」重新部署。
 
-## 4. 加入群組與初始化
+## 4. 部署 Webhook 代理
+
+LINE Verify 不接受 Google Apps Script 固定產生的 `302` 轉址，因此不能把 `/exec` 網址直接填入 LINE。使用免費 Cloudflare Worker 將回應轉成直接的 `200 OK`：
+
+1. 登入 https://dash.cloudflare.com 。
+2. 選擇「Workers & Pages → Create → Worker」。
+3. 建立 Worker 後點「Edit code」。
+4. 將 [cloudflare-worker.mjs](cloudflare-worker.mjs) 的完整內容貼入並部署。
+5. 到 Worker 的「Settings → Variables and Secrets」。
+6. 新增純文字變數：
+	- 名稱：`APPS_SCRIPT_URL`
+	- 值：上一節取得、以 `/exec` 結尾的 Apps Script 網頁應用程式網址
+7. 儲存並重新部署 Worker。
+8. 開啟 Worker 網址，應看到 `PAPER CALL webhook proxy is running.`。
+9. 複製 Worker 網址，例如 `https://paper-call.你的帳號.workers.dev`。
+10. 將 **Worker 網址** 貼入 LINE Developers → Messaging API → Webhook URL。
+11. 按 Verify，成功後開啟 Use webhook。
+
+不要再把 Apps Script `/exec` 網址直接填入 LINE Webhook；它會被 LINE 判定為 `302 Found`。
+
+## 5. 加入群組與初始化
 
 1. 將 LINE 官方帳號邀請到目標群組。
 2. 第一位管理員在群組輸入：`初始化管理員`。
@@ -69,7 +88,7 @@ Token 只放 Script Properties，不要寫進程式或 GitHub。
 
 如果已在 Script Properties 填入 `LINE_ADMIN_USER_IDS`，不需要執行初始化管理員。可在群組輸入「我的ID」取得 User ID。
 
-## 5. 設定會議
+## 6. 設定會議
 
 固定每週開會：
 
@@ -80,7 +99,7 @@ Token 只放 Script Properties，不要寫進程式或 GitHub。
 
 - `設定下次會議 2026/07/21 10:00`
 
-## 6. 設定前一天自動提醒
+## 7. 設定前一天自動提醒
 
 在 Apps Script 左側「觸發條件」新增：
 
