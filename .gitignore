@@ -1,0 +1,12 @@
+# Local credentials and clasp settings
+.clasp.json
+.env
+.env.*
+credentials.json
+token.json
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
