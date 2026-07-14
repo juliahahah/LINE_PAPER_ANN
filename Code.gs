@@ -1,39 +1,56 @@
-const DEFAULT_CONFIG = {
-  spreadsheetId: '1ncJnbfJXqyWPDPKmtAMgC91Gg_p-_mjnsRO9r-3Jl-4',
-  sheetName: '報告輪值表',
-  lineChannelAccessToken: '',
-  lineTargetId: '',
-  reminderCount: 2,
-};
-
-const BOT_KEYS = {
-  bindingPrefix: 'BINDING_',
-  deferredPrefix: 'DEFERRED_',
+const KEYS = {
+  roster: 'ROSTER',
+  queue: 'ROTATION_QUEUE',
+  deferred: 'DEFERRED_REPORTERS',
+  weeklyMeeting: 'WEEKLY_MEETING',
+  nextMeeting: 'NEXT_MEETING',
+  groupId: 'LINE_TARGET_ID',
+  admins: 'LINE_ADMIN_USER_IDS',
+  token: 'LINE_CHANNEL_ACCESS_TOKEN',
+  webhookSecret: 'WEBHOOK_SECRET',
   assignmentPrefix: 'ASSIGNMENT_',
   skippedPrefix: 'SKIPPED_',
+  sentPrefix: 'REMINDER_SENT_',
+};
+
+const WEEKDAYS = {
+  '星期日': 0, '週日': 0, '星期天': 0, '週天': 0,
+  '星期一': 1, '週一': 1,
+  '星期二': 2, '週二': 2,
+  '星期三': 3, '週三': 3,
+  '星期四': 4, '週四': 4,
+  '星期五': 5, '週五': 5,
+  '星期六': 6, '週六': 6,
 };
 
 function doGet() {
-  return ContentService.createTextOutput('LINE report bot is running.');
+  return ContentService.createTextOutput('LINE rotation bot is running.');
 }
 
 function doPost(e) {
   try {
-    const expectedSecret = PropertiesService.getScriptProperties().getProperty('WEBHOOK_SECRET');
-    if (!expectedSecret || !e.parameter || e.parameter.key !== expectedSecret) {
+    const expected = getProperty_(KEYS.webhookSecret);
+    if (expected && (!e.parameter || e.parameter.key !== expected)) {
       return ContentService.createTextOutput('Forbidden');
     }
     const body = JSON.parse(e.postData.contents);
-    (body.events || []).forEach(handleLineEvent_);
+    (body.events || []).forEach(function (event) {
+      try {
+        handleEvent_(event);
+      } catch (eventError) {
+        console.error(eventError.stack || eventError);
+      }
+    });
   } catch (error) {
     console.error(error.stack || error);
   }
   return ContentService.createTextOutput('OK');
 }
 
-function handleLineEvent_(event) {
-  if (!isAllowedSource_(event.source)) return;
-  rememberLineTarget_(event.source);
+function handleEvent_(event) {
+  if (!isAllowedGroup_(event.source)) return;
+  rememberGroup_(event.source);
+
   if (event.type === 'postback') {
     handlePostback_(event);
     return;
@@ -41,522 +58,494 @@ function handleLineEvent_(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const text = event.message.text.trim();
-  const bindingMatch = text.match(/^綁定\s+(.+)$/);
-  if (bindingMatch) {
-    bindMember_(event, bindingMatch[1].trim());
-  } else if (/^(輪值|本週報告|下一位)$/.test(text)) {
-    replyWithNextMeeting_(event.replyToken);
-  } else if (text === '請假') {
-    requestLeave_(event);
-  } else if (text === '完成') {
-    markMyReportComplete_(event);
-  } else if (text === '我的ID') {
-    replyText_(event.replyToken, event.source.userId || '無法取得 User ID');
-  } else if (/^啟用輪值\s+(.+)$/.test(text)) {
-    updateActiveReporter_(event, text.match(/^啟用輪值\s+(.+)$/)[1].trim(), true);
-  } else if (/^停用輪值\s+(.+)$/.test(text)) {
-    updateActiveReporter_(event, text.match(/^停用輪值\s+(.+)$/)[1].trim(), false);
-  } else if (text === '輪值名單') {
-    replyActiveReporters_(event);
-  } else if (/^(說明|help|幫助)$/i.test(text)) {
-    replyText_(event.replyToken, buildHelpText_());
+  if (text === '初始化管理員') initializeAdmin_(event);
+  else if (text === '我的ID') replyText_(event.replyToken, event.source.userId || '無法取得 User ID');
+  else if (/^加入輪值/.test(text)) addMentionedMembers_(event);
+  else if (/^移除輪值/.test(text)) removeMentionedMembers_(event);
+  else if (text === '加入我輪值') addSelf_(event);
+  else if (text === '輪值名單') replyRoster_(event);
+  else if (/^設定週會\s+/.test(text)) setWeeklyMeeting_(event, text);
+  else if (/^設定下次會議\s+/.test(text)) setNextMeeting_(event, text);
+  else if (/^(輪值|本週報告|下一位)$/.test(text)) replyCurrentRotation_(event.replyToken);
+  else if (text === '請假') requestLeave_(event);
+  else if (text === '完成') completeReport_(event);
+  else if (/^(說明|help|幫助)$/i.test(text)) replyText_(event.replyToken, helpText_());
+}
+
+function initializeAdmin_(event) {
+  withLock_(function () {
+  const admins = getAdminIds_();
+  if (admins.length) {
+    replyText_(event.replyToken, '管理員已設定，無法再次初始化。');
+    return;
   }
+  if (!event.source.userId) {
+    replyText_(event.replyToken, '無法取得你的 LINE User ID。');
+    return;
+  }
+  setProperty_(KEYS.admins, event.source.userId);
+  replyText_(event.replyToken, '初始化完成，你已成為 Bot 管理員。');
+  });
+}
+
+function addMentionedMembers_(event) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+  const mentionees = getMentionedUsers_(event.message);
+  if (!mentionees.length) {
+    replyText_(event.replyToken, '請輸入「加入輪值」並標註要加入的群組成員。');
+    return;
+  }
+  const roster = getRoster_();
+  const queue = getQueue_();
+  const added = [];
+  mentionees.forEach(function (mentionee) {
+    if (roster.some(function (member) { return member.userId === mentionee.userId; })) return;
+    const name = getMemberName_(event.source, mentionee.userId, mentionee.fallbackName);
+    roster.push({ userId: mentionee.userId, name: name });
+    queue.push(mentionee.userId);
+    added.push(name);
+  });
+  saveRosterAndQueue_(roster, queue);
+  clearFutureAssignments_();
+  replyText_(event.replyToken, added.length ? '已加入輪值：' + added.join('、') : '這些成員已在輪值名單中。');
+  });
+}
+
+function addSelf_(event) {
+  withLock_(function () {
+  if (!event.source.userId) {
+    replyText_(event.replyToken, '無法取得你的 LINE User ID。');
+    return;
+  }
+  const roster = getRoster_();
+  if (roster.some(function (member) { return member.userId === event.source.userId; })) {
+    replyText_(event.replyToken, '你已在輪值名單中。');
+    return;
+  }
+  const name = getMemberName_(event.source, event.source.userId, 'LINE 成員');
+  const queue = getQueue_();
+  roster.push({ userId: event.source.userId, name: name });
+  queue.push(event.source.userId);
+  saveRosterAndQueue_(roster, queue);
+  clearFutureAssignments_();
+  replyText_(event.replyToken, name + ' 已加入輪值。');
+  });
+}
+
+function removeMentionedMembers_(event) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+  const mentionees = getMentionedUsers_(event.message);
+  if (!mentionees.length) {
+    replyText_(event.replyToken, '請輸入「移除輪值」並標註要移除的成員。');
+    return;
+  }
+  const ids = new Set(mentionees.map(function (item) { return item.userId; }));
+  const roster = getRoster_();
+  const removed = roster.filter(function (member) { return ids.has(member.userId); });
+  const newRoster = roster.filter(function (member) { return !ids.has(member.userId); });
+  const newQueue = getQueue_().filter(function (id) { return !ids.has(id); });
+  const deferred = getDeferred_().filter(function (item) { return !ids.has(item.userId); });
+  saveRosterAndQueue_(newRoster, newQueue);
+  setJson_(KEYS.deferred, deferred);
+  clearFutureAssignments_();
+  replyText_(event.replyToken, removed.length ? '已移除：' + removed.map(function (member) { return member.name; }).join('、') : '指定成員不在輪值名單中。');
+  });
+}
+
+function replyRoster_(event) {
+  const roster = getRoster_();
+  const queue = getOrderedCandidates_(new Date(8640000000000000));
+  if (!roster.length) {
+    replyText_(event.replyToken, '目前沒有輪值成員。管理員可輸入「加入輪值」並標註成員。');
+    return;
+  }
+  const names = queue.map(function (id, index) {
+    return (index + 1) + '. ' + memberName_(id, roster);
+  });
+  replyText_(event.replyToken, '目前輪值順序：\n' + names.join('\n'));
+}
+
+function setWeeklyMeeting_(event, text) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+  const match = text.match(/^設定週會\s+(星期[一二三四五六日天]|週[一二三四五六日天])\s+(\d{1,2}):(\d{2})$/);
+  if (!match || WEEKDAYS[match[1]] === undefined || !validTime_(Number(match[2]), Number(match[3]))) {
+    replyText_(event.replyToken, '格式：設定週會 星期二 10:00');
+    return;
+  }
+  const config = { weekday: WEEKDAYS[match[1]], hour: Number(match[2]), minute: Number(match[3]), label: match[1] };
+  setJson_(KEYS.weeklyMeeting, config);
+  clearFutureAssignments_();
+  replyText_(event.replyToken, '已設定每週 ' + match[1] + ' ' + pad_(config.hour) + ':' + pad_(config.minute) + ' 開會。');
+  });
+}
+
+function setNextMeeting_(event, text) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+  const match = text.match(/^設定下次會議\s+(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})$/);
+  if (!match) {
+    replyText_(event.replyToken, '格式：設定下次會議 2026/07/21 10:00');
+    return;
+  }
+  const date = makeDate_(Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
+  if (!date || date.getTime() <= Date.now()) {
+    replyText_(event.replyToken, '日期時間無效，或會議時間已經過去。');
+    return;
+  }
+  setProperty_(KEYS.nextMeeting, String(date.getTime()));
+  clearFutureAssignments_();
+  replyText_(event.replyToken, '下次會議已設定為 ' + formatDateTime_(date) + '。');
+  });
 }
 
 function sendDailyReminder() {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-  const context = getSheetContext_();
-  const tomorrow = addDays_(startOfDay_(new Date()), 1);
-  if (!hasMeetingOn_(context.rows, tomorrow) || isMeetingSkipped_(tomorrow)) {
-    Logger.log('Tomorrow has no active meeting.');
-    return;
-  }
-
-  const sentKey = 'REMINDER_SENT_' + dateKey_(tomorrow);
-  if (PropertiesService.getScriptProperties().getProperty(sentKey)) {
-    Logger.log('Reminder already sent.');
-    return;
-  }
-
-  const targets = getOrCreateAssignment_(context, tomorrow);
-  if (targets.length === 0) {
-    Logger.log('No active presenters found.');
-    return;
-  }
-  pushMessages_(context.config, [buildReminderMessage_(tomorrow, targets)]);
-  PropertiesService.getScriptProperties().setProperty(sentKey, new Date().toISOString());
-  refreshAutoResults();
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function sendWeeklyReminder() {
-  const context = getSheetContext_();
-  const meetingDate = findNextMeetingDate_(context.rows, startOfDay_(new Date()), true);
-  if (!meetingDate) {
-    Logger.log('No future meeting found.');
-    return;
-  }
-  pushMessages_(context.config, [buildReminderMessage_(meetingDate, getOrCreateAssignment_(context, meetingDate))]);
-  refreshAutoResults();
-}
-
-function refreshAutoResults() {
-  const context = getSheetContext_();
-  const nextMeeting = findNextMeetingDate_(context.rows, startOfDay_(new Date()), true);
-  const nextTargets = nextMeeting ? getOrCreateAssignment_(context, nextMeeting) : [];
-  const nextRows = new Set(nextTargets.map(function (row) { return row.rowNumber; }));
-
-  context.rows.forEach(function (row) {
-    const status = normalizeStatus_(row.status);
-    let result = '等待中';
-    if (isCompletedStatus_(status)) result = '已完成';
-    else if (isLeaveStatus_(status)) result = '請假，下次補報告';
-    else if (nextRows.has(row.rowNumber)) result = '下一個';
-    context.sheet.getRange(row.rowNumber, context.layout.resultColumn).setValue(result);
+  withLock_(function () {
+    const meeting = findNextMeeting_(new Date());
+    if (!meeting) return;
+    const tomorrow = addDays_(startOfDay_(new Date()), 1);
+    if (startOfDay_(meeting).getTime() !== tomorrow.getTime()) return;
+    const sentKey = KEYS.sentPrefix + meetingKey_(meeting);
+    if (getProperty_(sentKey)) return;
+    const assignment = getOrCreateAssignment_(meeting);
+    if (!assignment.length) return;
+    pushMessages_([buildRotationMessage_(meeting, assignment, true)]);
+    setProperty_(sentKey, new Date().toISOString());
   });
 }
 
-function bindMember_(event, requestedName) {
-  const userId = event.source && event.source.userId;
-  if (!userId) {
-    replyText_(event.replyToken, 'LINE 沒有提供你的使用者 ID，請確認官方帳號已加入群組後再試一次。');
+function replyCurrentRotation_(replyToken) {
+  const meeting = findNextMeeting_(new Date());
+  if (!meeting) {
+    replyText_(replyToken, '尚未設定會議。管理員請輸入「設定週會 星期二 10:00」。');
     return;
   }
-  const context = getSheetContext_();
-  const match = context.rows.find(function (row) {
-    return row.reporter.toLowerCase() === requestedName.toLowerCase();
-  });
-  if (!match) {
-    replyText_(event.replyToken, '名單中找不到「' + requestedName + '」，請輸入與 Sheet 完全相同的姓名。');
-    return;
-  }
-  const props = PropertiesService.getScriptProperties();
-  const ownerKey = Object.keys(props.getProperties()).find(function (key) {
-    return key.indexOf(BOT_KEYS.bindingPrefix) === 0 && key !== BOT_KEYS.bindingPrefix + userId &&
-      props.getProperty(key) === match.reporter;
-  });
-  if (ownerKey) {
-    replyText_(event.replyToken, '「' + match.reporter + '」已綁定其他 LINE 帳號，請聯絡管理員處理。');
-    return;
-  }
-  props.setProperty(BOT_KEYS.bindingPrefix + userId, match.reporter);
-  replyText_(event.replyToken, '綁定完成：' + match.reporter + '\n輪到你時可按「我要請假」或輸入「完成」。');
-}
-
-function updateActiveReporter_(event, requestedName, active) {
-  if (!canSkipMeeting_(event.source.userId)) {
-    replyText_(event.replyToken, '只有管理員可以修改輪值名單。');
-    return;
-  }
-  const context = getSheetContext_();
-  const canonicalName = getUniqueReporterNames_(context.rows).find(function (name) {
-    return name.toLowerCase() === requestedName.toLowerCase();
-  });
-  if (!canonicalName) {
-    replyText_(event.replyToken, 'Sheet 名單中找不到「' + requestedName + '」。');
-    return;
-  }
-
-  const props = PropertiesService.getScriptProperties();
-  const stored = props.getProperty('ACTIVE_REPORTERS');
-  let names = stored ? JSON.parse(stored) : (active ? [] : getUniqueReporterNames_(context.rows));
-  names = names.filter(function (name) { return name !== canonicalName; });
-  if (active) names.push(canonicalName);
-  props.setProperty('ACTIVE_REPORTERS', JSON.stringify(names));
-  clearAssignmentCache_();
-  replyText_(event.replyToken, canonicalName + (active ? ' 已加入輪值。' : ' 已暫停輪值。') + '\n目前名單：' + (names.join('、') || '無'));
-  refreshAutoResults();
-}
-
-function replyActiveReporters_(event) {
-  const context = getSheetContext_();
-  const active = getActiveReporterNames_(context.rows);
-  const mode = PropertiesService.getScriptProperties().getProperty('ACTIVE_REPORTERS') ? '指定名單' : 'Sheet 全部人員';
-  replyText_(event.replyToken, '目前輪值（' + mode + '）：\n' + (active.join('、') || '無'));
-}
-
-function getUniqueReporterNames_(rows) {
-  return Array.from(new Set(rows.map(function (row) { return row.reporter; })));
-}
-
-function getActiveReporterNames_(rows) {
-  const stored = PropertiesService.getScriptProperties().getProperty('ACTIVE_REPORTERS');
-  return stored ? JSON.parse(stored) : getUniqueReporterNames_(rows);
-}
-
-function clearAssignmentCache_() {
-  const props = PropertiesService.getScriptProperties();
-  Object.keys(props.getProperties()).forEach(function (key) {
-    if (key.indexOf(BOT_KEYS.assignmentPrefix) === 0) props.deleteProperty(key);
-  });
+  replyMessages_(replyToken, [buildRotationMessage_(meeting, getOrCreateAssignment_(meeting), false)]);
 }
 
 function requestLeave_(event) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-  const member = getBoundMember_(event.source);
-  if (!member) {
-    replyText_(event.replyToken, '請先輸入「綁定 你的姓名」，例如：綁定 Julia_Liu');
-    return;
-  }
-
-  const context = getSheetContext_();
-  const meetingDate = findNextMeetingDate_(context.rows, startOfDay_(new Date()), true);
-  if (!meetingDate) {
-    replyText_(event.replyToken, '目前沒有即將到來的報告輪值。');
-    return;
-  }
-  const targets = getOrCreateAssignment_(context, meetingDate);
-  const myRow = targets.find(function (row) { return row.reporter === member; });
-  if (!myRow) {
-    replyText_(event.replyToken, member + ' 目前不在下一次報告名單中，無需請假。');
-    return;
-  }
-
-  deferReporter_(context, myRow, meetingDate);
-  const replacements = replaceAssignment_(context, meetingDate, myRow.rowNumber);
-  const names = replacements.map(function (row) { return row.reporter; }).join('、') || '尚無替補人員';
-  replyText_(event.replyToken, member + ' 已請假，將在下一個開會週優先補報告。\n更新後輪值：' + names);
-  notifyGroup_(event.source, member + ' 本次請假，更新後報告人：' + names);
-  refreshAutoResults();
-  } finally {
-    lock.releaseLock();
-  }
+  withLock_(function () {
+    const userId = event.source.userId;
+    const meeting = findNextMeeting_(new Date());
+    if (!meeting) {
+      replyText_(event.replyToken, '目前沒有即將到來的會議。');
+      return;
+    }
+    const assignment = getOrCreateAssignment_(meeting);
+    if (assignment.indexOf(userId) === -1) {
+      replyText_(event.replyToken, '你目前不在下一次報告名單中，無需請假。');
+      return;
+    }
+    const deferred = getDeferred_().filter(function (item) { return item.userId !== userId; });
+    deferred.push({ userId: userId, after: meeting.getTime() });
+    setJson_(KEYS.deferred, deferred);
+    const updated = assignment.filter(function (id) { return id !== userId; });
+    const candidates = getOrderedCandidates_(meeting).filter(function (id) {
+      return updated.indexOf(id) === -1 && id !== userId;
+    });
+    if (candidates.length) updated.push(candidates[0]);
+    setAssignment_(meeting, updated);
+    const name = memberName_(userId);
+    replyText_(event.replyToken, name + ' 已請假，下一個開會週會優先補報告。');
+    pushMessages_([buildRotationMessage_(meeting, updated, false)]);
+  });
 }
 
-function deferReporter_(context, row, currentMeeting) {
-  const nextMeeting = findNextMeetingDate_(context.rows, addDays_(currentMeeting, 1), true);
-  context.sheet.getRange(row.rowNumber, context.layout.statusColumn).setValue('請假');
-  PropertiesService.getScriptProperties().setProperty(
-    BOT_KEYS.deferredPrefix + row.rowNumber,
-    String(nextMeeting ? nextMeeting.getTime() : addDays_(currentMeeting, 7).getTime())
-  );
-}
-
-function markMyReportComplete_(event) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-  const member = getBoundMember_(event.source);
-  if (!member) {
-    replyText_(event.replyToken, '請先輸入「綁定 你的姓名」。');
-    return;
-  }
-  const context = getSheetContext_();
-  const meetingDate = findNextMeetingDate_(context.rows, startOfDay_(new Date()), true);
-  const assigned = meetingDate ? getOrCreateAssignment_(context, meetingDate) : [];
-  const candidate = assigned.find(function (row) { return row.reporter === member; });
-  if (!candidate) {
-    replyText_(event.replyToken, member + ' 沒有待完成的報告。');
-    return;
-  }
-  context.sheet.getRange(candidate.rowNumber, context.layout.statusColumn).setValue('已報告');
-  clearDeferred_(candidate.rowNumber);
-  replaceAssignment_(context, meetingDate, candidate.rowNumber);
-  replyText_(event.replyToken, member + ' 已標記為完成，謝謝！');
-  refreshAutoResults();
-  } finally {
-    lock.releaseLock();
-  }
+function completeReport_(event) {
+  withLock_(function () {
+    const userId = event.source.userId;
+    const meeting = findActionableMeetingForUser_(userId);
+    if (!meeting) {
+      replyText_(event.replyToken, '目前沒有進行中的報告輪值。');
+      return;
+    }
+    const assignment = getOrCreateAssignment_(meeting);
+    if (assignment.indexOf(userId) === -1) {
+      replyText_(event.replyToken, '你不在這次報告名單中。');
+      return;
+    }
+    rotateToEnd_(userId);
+    const deferred = getDeferred_().filter(function (item) { return item.userId !== userId; });
+    setJson_(KEYS.deferred, deferred);
+    setAssignment_(meeting, assignment.filter(function (id) { return id !== userId; }));
+    replyText_(event.replyToken, memberName_(userId) + ' 已完成報告並排到輪值尾端。');
+  });
 }
 
 function handlePostback_(event) {
-  const data = parsePostback_(event.postback.data);
+  const data = parseQuery_(event.postback.data);
   if (data.action === 'leave') requestLeave_(event);
-  else if (data.action === 'complete') markMyReportComplete_(event);
+  else if (data.action === 'complete') completeReport_(event);
   else if (data.action === 'skip_prompt') {
-    if (!canSkipMeeting_(event.source.userId)) {
-      replyText_(event.replyToken, '只有管理員可以設定本週停會。');
+    if (!requireAdmin_(event)) return;
+    replyMessages_(event.replyToken, [skipConfirmation_(data.date)]);
+  } else if (data.action === 'skip_confirm') skipMeeting_(event, data.date);
+}
+
+function skipMeeting_(event, dateValue) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+    const date = parseDateKey_(dateValue);
+    if (!date) {
+      replyText_(event.replyToken, '無法辨識會議日期。');
       return;
     }
-    replyMessages_(event.replyToken, [buildSkipConfirmation_(data.date)]);
-  } else if (data.action === 'skip_confirm') {
-    skipMeeting_(event, data.date);
-  }
-}
-
-function skipMeeting_(event, dateKey) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-  if (!canSkipMeeting_(event.source.userId)) {
-    replyText_(event.replyToken, '只有管理員可以設定本週停會。');
-    return;
-  }
-  const meetingDate = parseDateKey_(dateKey);
-  if (!meetingDate) {
-    replyText_(event.replyToken, '無法辨識開會日期。');
-    return;
-  }
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty(BOT_KEYS.skippedPrefix + dateKey, 'true');
-  props.deleteProperty(BOT_KEYS.assignmentPrefix + dateKey);
-  const text = formatDate_(meetingDate) + ' 已設為不開會，本週不會通知或消耗報告名單。';
-  replyText_(event.replyToken, text);
-  notifyGroup_(event.source, text);
-  refreshAutoResults();
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function replyWithNextMeeting_(replyToken) {
-  const context = getSheetContext_();
-  const meetingDate = findNextMeetingDate_(context.rows, startOfDay_(new Date()), true);
-  if (!meetingDate) {
-    replyText_(replyToken, '目前 Sheet 中沒有未來的開會日期。');
-    return;
-  }
-  replyMessages_(replyToken, [buildReminderMessage_(meetingDate, getOrCreateAssignment_(context, meetingDate))]);
-}
-
-function getOrCreateAssignment_(context, meetingDate) {
-  const props = PropertiesService.getScriptProperties();
-  const key = BOT_KEYS.assignmentPrefix + dateKey_(meetingDate);
-  const saved = props.getProperty(key);
-  if (saved) return rowsFromNumbers_(context.rows, JSON.parse(saved));
-
-  const targets = pickTargetsForMeeting_(context.rows, meetingDate, context.config.reminderCount);
-  targets.forEach(function (row) {
-    const deferredKey = BOT_KEYS.deferredPrefix + row.rowNumber;
-    if (props.getProperty(deferredKey)) {
-      context.sheet.getRange(row.rowNumber, context.layout.statusColumn).setValue('未報告');
-      row.status = '未報告';
+    setProperty_(KEYS.skippedPrefix + dateValue, 'true');
+    deleteMeetingStateForDate_(date);
+    if (Number(getProperty_(KEYS.nextMeeting)) && dateKey_(new Date(Number(getProperty_(KEYS.nextMeeting)))) === dateValue) {
+      deleteProperty_(KEYS.nextMeeting);
     }
+    replyText_(event.replyToken, formatDate_(date) + ' 已設定為不開會，輪值順序保持不變。');
   });
-  props.setProperty(key, JSON.stringify(targets.map(function (row) { return row.rowNumber; })));
-  return targets;
 }
 
-function replaceAssignment_(context, meetingDate, excludedRowNumber) {
-  const props = PropertiesService.getScriptProperties();
-  const key = BOT_KEYS.assignmentPrefix + dateKey_(meetingDate);
-  const current = JSON.parse(props.getProperty(key) || '[]').filter(function (rowNumber) {
-    return rowNumber !== excludedRowNumber;
-  });
-  const excluded = new Set(current.concat([excludedRowNumber]));
-  const candidates = pickTargetsForMeeting_(context.rows, meetingDate, context.rows.length)
-    .filter(function (row) { return !excluded.has(row.rowNumber); });
-  while (current.length < context.config.reminderCount && candidates.length) current.push(candidates.shift().rowNumber);
-  rowsFromNumbers_(context.rows, current).forEach(function (row) {
-    if (props.getProperty(BOT_KEYS.deferredPrefix + row.rowNumber)) {
-      context.sheet.getRange(row.rowNumber, context.layout.statusColumn).setValue('未報告');
-      row.status = '未報告';
+function getOrCreateAssignment_(meeting) {
+  const key = KEYS.assignmentPrefix + meetingKey_(meeting);
+  const saved = getJson_(key, null);
+  if (saved) return saved.filter(isActiveMember_);
+  const assignment = getOrderedCandidates_(meeting).slice(0, reminderCount_());
+  setJson_(key, assignment);
+  return assignment;
+}
+
+function setAssignment_(meeting, assignment) {
+  setJson_(KEYS.assignmentPrefix + meetingKey_(meeting), assignment);
+}
+
+function getOrderedCandidates_(meeting) {
+  const activeIds = new Set(getRoster_().map(function (member) { return member.userId; }));
+  const allDeferred = getDeferred_().filter(function (item) { return activeIds.has(item.userId); });
+  const eligibleDeferred = allDeferred.filter(function (item) { return item.after < meeting.getTime(); })
+    .map(function (item) { return item.userId; });
+  const deferredIds = new Set(allDeferred.map(function (item) { return item.userId; }));
+  const queue = getQueue_().filter(function (id) { return activeIds.has(id) && !deferredIds.has(id); });
+  return eligibleDeferred.concat(queue);
+}
+
+function rotateToEnd_(userId) {
+  const queue = getQueue_().filter(function (id) { return id !== userId; });
+  if (isActiveMember_(userId)) queue.push(userId);
+  setJson_(KEYS.queue, queue);
+}
+
+function findNextMeeting_(from) {
+  const oneOff = Number(getProperty_(KEYS.nextMeeting) || 0);
+  const candidates = [];
+  if (oneOff > from.getTime()) candidates.push(new Date(oneOff));
+
+  const weekly = getJson_(KEYS.weeklyMeeting, null);
+  if (weekly) {
+    for (let offset = 0; offset <= 366; offset++) {
+      const day = addDays_(startOfDay_(from), offset);
+      if (day.getDay() !== weekly.weekday) continue;
+      const meeting = new Date(day.getFullYear(), day.getMonth(), day.getDate(), weekly.hour, weekly.minute);
+      if (meeting.getTime() > from.getTime() && !isSkipped_(meeting)) {
+        candidates.push(meeting);
+        break;
+      }
     }
+  }
+  return candidates.filter(function (date) { return !isSkipped_(date); })
+    .sort(function (a, b) { return a.getTime() - b.getTime(); })[0] || null;
+}
+
+function buildRotationMessage_(meeting, userIds, isReminder) {
+  const roster = getRoster_();
+  let text = isReminder ? '📣 明天報告提醒\n' : '📋 下一次報告輪值\n';
+  text += '會議：' + formatDateTime_(meeting) + '\n報告人：';
+  const mentionees = [];
+  if (!userIds.length) text += '\n尚無輪值成員';
+  userIds.forEach(function (userId, index) {
+    const token = '@' + memberName_(userId, roster);
+    text += '\n' + (index + 1) + '. ';
+    const mentionIndex = text.length;
+    text += token;
+    mentionees.push({ index: mentionIndex, length: token.length, userId: userId });
   });
-  props.setProperty(key, JSON.stringify(current));
-  return rowsFromNumbers_(context.rows, current);
-}
-
-function rowsFromNumbers_(rows, rowNumbers) {
-  return rowNumbers.map(function (rowNumber) {
-    return rows.find(function (row) { return row.rowNumber === rowNumber; });
-  }).filter(Boolean);
-}
-
-function pickTargetsForMeeting_(rows, meetingDate, count) {
-  const props = PropertiesService.getScriptProperties();
-  const activeNames = new Set(getActiveReporterNames_(rows));
-  const deferred = [];
-  const regular = [];
-  rows.forEach(function (row) {
-    if (!activeNames.has(row.reporter)) return;
-    const status = normalizeStatus_(row.status);
-    if (isCompletedStatus_(status)) return;
-    const deferredAt = Number(props.getProperty(BOT_KEYS.deferredPrefix + row.rowNumber) || 0);
-    if (deferredAt && deferredAt <= meetingDate.getTime()) deferred.push(row);
-    else if (!isLeaveStatus_(status)) regular.push(row);
-  });
-  return deferred.concat(regular).slice(0, count);
-}
-
-function buildReminderMessage_(meetingDate, targets) {
-  const names = targets.length ? targets.map(function (row, index) {
-    return (index + 1) + '. ' + row.reporter + (row.topic ? '｜' + row.topic : '');
-  }).join('\n') : '目前沒有可排入的人員';
-  const text = ('📣 報告提醒\n開會日期：' + formatDate_(meetingDate) + '\n本次報告：\n' + names +
-      '\n\n報告人可按「我要請假」；管理員可設定本週不開會。').slice(0, 5000);
-  return {
+  const message = {
     type: 'text',
-    text: text,
+    text: text.slice(0, 5000),
     quickReply: {
       items: [
         quickPostback_('🙋 我要請假', 'action=leave'),
         quickPostback_('✅ 完成報告', 'action=complete'),
-        quickPostback_('⏭️ 本週不開會', 'action=skip_prompt&date=' + dateKey_(meetingDate)),
+        quickPostback_('⏭️ 本週不開會', 'action=skip_prompt&date=' + dateKey_(meeting)),
       ],
     },
   };
+  if (mentionees.length) message.mention = { mentionees: mentionees };
+  return message;
 }
 
-function buildSkipConfirmation_(dateKey) {
+function skipConfirmation_(date) {
   return {
     type: 'template',
     altText: '確認本週不開會',
     template: {
       type: 'confirm',
-      text: '確定要將 ' + dateKey + ' 設為不開會嗎？名單會保留到下一週。',
+      text: '確定將 ' + date + ' 設為不開會嗎？輪值順序會保留。',
       actions: [
-        { type: 'postback', label: '確定 SKIP', data: 'action=skip_confirm&date=' + dateKey, displayText: '確定本週不開會' },
+        { type: 'postback', label: '確定 SKIP', data: 'action=skip_confirm&date=' + date, displayText: '確定本週不開會' },
         { type: 'message', label: '取消', text: '取消 SKIP' },
       ],
     },
   };
 }
 
+function getMentionedUsers_(message) {
+  const mentionees = message.mention && message.mention.mentionees || [];
+  return mentionees.filter(function (item) { return item.type === 'user' && item.userId; }).map(function (item) {
+    const raw = message.text.substring(item.index, item.index + item.length).replace(/^@/, '');
+    return { userId: item.userId, fallbackName: raw || 'LINE 成員' };
+  });
+}
+
+function getMemberName_(source, userId, fallback) {
+  try {
+    let path;
+    if (source.groupId) path = '/v2/bot/group/' + encodeURIComponent(source.groupId) + '/member/' + encodeURIComponent(userId);
+    else if (source.roomId) path = '/v2/bot/room/' + encodeURIComponent(source.roomId) + '/member/' + encodeURIComponent(userId);
+    else path = '/v2/bot/profile/' + encodeURIComponent(userId);
+    const response = lineRequest_(path, 'get');
+    return JSON.parse(response.getContentText()).displayName || fallback;
+  } catch (error) {
+    console.error(error);
+    return fallback;
+  }
+}
+
+function getRoster_() {
+  return getJson_(KEYS.roster, []);
+}
+
+function getQueue_() {
+  return getJson_(KEYS.queue, []);
+}
+
+function getDeferred_() {
+  return getJson_(KEYS.deferred, []).map(function (item) {
+    return typeof item === 'string' ? { userId: item, after: 0 } : item;
+  }).filter(function (item) { return item && item.userId; });
+}
+
+function saveRosterAndQueue_(roster, queue) {
+  setJson_(KEYS.roster, roster);
+  setJson_(KEYS.queue, Array.from(new Set(queue)));
+}
+
+function memberName_(userId, optionalRoster) {
+  const member = (optionalRoster || getRoster_()).find(function (item) { return item.userId === userId; });
+  return member ? member.name : '未知成員';
+}
+
+function isActiveMember_(userId) {
+  return getRoster_().some(function (member) { return member.userId === userId; });
+}
+
+function clearFutureAssignments_() {
+  const props = PropertiesService.getScriptProperties();
+  Object.keys(props.getProperties()).forEach(function (key) {
+    if (key.indexOf(KEYS.assignmentPrefix) === 0 || key.indexOf(KEYS.sentPrefix) === 0) props.deleteProperty(key);
+  });
+}
+
+function rememberGroup_(source) {
+  const incoming = source && (source.groupId || source.roomId);
+  if (incoming && !getProperty_(KEYS.groupId)) setProperty_(KEYS.groupId, incoming);
+}
+
+function isAllowedGroup_(source) {
+  const configured = getProperty_(KEYS.groupId);
+  const incoming = source && (source.groupId || source.roomId);
+  return Boolean(incoming) && (!configured || configured === incoming);
+}
+
+function requireAdmin_(event) {
+  if (getAdminIds_().indexOf(event.source.userId) !== -1) return true;
+  replyText_(event.replyToken, '只有管理員可以執行這個操作。');
+  return false;
+}
+
+function getAdminIds_() {
+  return String(getProperty_(KEYS.admins) || '').split(',').map(function (id) { return id.trim(); }).filter(Boolean);
+}
+
+function reminderCount_() {
+  const value = Number(getProperty_('REMINDER_COUNT') || 2);
+  return Number.isFinite(value) ? Math.max(1, Math.min(Math.floor(value), 10)) : 2;
+}
+
+function findActionableMeetingForUser_(userId) {
+  const now = Date.now();
+  const lowerBound = now - 7 * 24 * 60 * 60 * 1000;
+  const matches = [];
+  const properties = PropertiesService.getScriptProperties().getProperties();
+  Object.keys(properties).forEach(function (key) {
+    if (key.indexOf(KEYS.assignmentPrefix) !== 0) return;
+    const timestamp = Number(key.substring(KEYS.assignmentPrefix.length));
+    if (!Number.isFinite(timestamp) || timestamp < lowerBound) return;
+    const assignment = getJson_(key, []);
+    if (assignment.indexOf(userId) !== -1 && !isSkipped_(new Date(timestamp))) matches.push(timestamp);
+  });
+  const past = matches.filter(function (timestamp) { return timestamp <= now; }).sort(function (a, b) { return b - a; });
+  const future = matches.filter(function (timestamp) { return timestamp > now; }).sort(function (a, b) { return a - b; });
+  if (past.length) return new Date(past[0]);
+  if (future.length) return new Date(future[0]);
+  const next = findNextMeeting_(new Date());
+  if (!next) return null;
+  return getOrCreateAssignment_(next).indexOf(userId) !== -1 ? next : null;
+}
+
+function deleteMeetingStateForDate_(date) {
+  const props = PropertiesService.getScriptProperties();
+  Object.keys(props.getProperties()).forEach(function (key) {
+    if (key.indexOf(KEYS.assignmentPrefix) !== 0 && key.indexOf(KEYS.sentPrefix) !== 0) return;
+    const prefix = key.indexOf(KEYS.assignmentPrefix) === 0 ? KEYS.assignmentPrefix : KEYS.sentPrefix;
+    const timestamp = Number(key.substring(prefix.length));
+    if (Number.isFinite(timestamp) && dateKey_(new Date(timestamp)) === dateKey_(date)) props.deleteProperty(key);
+  });
+}
+
+function pushMessages_(messages) {
+  const target = getProperty_(KEYS.groupId);
+  if (!target) throw new Error('尚未取得 LINE 群組 ID。');
+  lineRequest_('/v2/bot/message/push', 'post', { to: target, messages: messages });
+}
+
+function replyText_(replyToken, text) {
+  replyMessages_(replyToken, [{ type: 'text', text: text.slice(0, 5000) }]);
+}
+
+function replyMessages_(replyToken, messages) {
+  lineRequest_('/v2/bot/message/reply', 'post', { replyToken: replyToken, messages: messages });
+}
+
+function lineRequest_(path, method, payload) {
+  const token = getProperty_(KEYS.token);
+  if (!token) throw new Error('請設定 LINE_CHANNEL_ACCESS_TOKEN。');
+  const options = {
+    method: method,
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + token },
+  };
+  if (payload) {
+    options.contentType = 'application/json; charset=UTF-8';
+    options.payload = JSON.stringify(payload);
+  }
+  const response = UrlFetchApp.fetch('https://api.line.me' + path, options);
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
+    throw new Error('LINE API 失敗：' + response.getResponseCode() + ' ' + response.getContentText());
+  }
+  return response;
+}
+
 function quickPostback_(label, data) {
   return { type: 'action', action: { type: 'postback', label: label, data: data, displayText: label } };
 }
 
-function getSheetContext_() {
-  const config = getConfig_();
-  const sheet = getSheet_(config);
-  const layout = detectLayout_(sheet);
-  return { config: config, sheet: sheet, layout: layout, rows: readRows_(sheet, layout) };
-}
-
-function detectLayout_(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
-  for (let i = 0; i < Math.min(values.length, 30); i++) {
-    const normalized = values[i].map(normalizeStatus_);
-    const reporterColumn = normalized.indexOf('報告人') + 1;
-    const statusColumn = normalized.indexOf('狀態') + 1;
-    if (reporterColumn && statusColumn) {
-      const layout = {
-        headerRow: i + 1,
-        reportDateColumn: normalized.indexOf('報告日期') + 1,
-        reporterColumn: reporterColumn,
-        topicColumn: normalized.indexOf('報告主題') + 1,
-        statusColumn: statusColumn,
-        resultColumn: normalized.findIndex(function (value) { return value.indexOf('結果') === 0; }) + 1,
-      };
-      if (layout.reportDateColumn && layout.topicColumn && layout.resultColumn) return layout;
-    }
-  }
-  throw new Error('找不到表頭，請確認欄位包含「報告日期、報告人、報告主題、狀態、結果」。');
-}
-
-function readRows_(sheet, layout) {
-  const values = sheet.getDataRange().getValues();
-  const rows = [];
-  for (let i = layout.headerRow; i < values.length; i++) {
-    const row = values[i];
-    const reporter = String(row[layout.reporterColumn - 1] || '').trim();
-    if (!reporter) continue;
-    rows.push({
-      rowNumber: i + 1,
-      reportDate: parseSheetDate_(row[layout.reportDateColumn - 1]),
-      reporter: reporter,
-      topic: String(row[layout.topicColumn - 1] || '').trim(),
-      status: String(row[layout.statusColumn - 1] || '').trim(),
-    });
-  }
-  return rows;
-}
-
-function getConfig_() {
-  const props = PropertiesService.getScriptProperties();
-  return {
-    spreadsheetId: props.getProperty('SPREADSHEET_ID') || DEFAULT_CONFIG.spreadsheetId,
-    sheetName: props.getProperty('SHEET_NAME') || DEFAULT_CONFIG.sheetName,
-    lineChannelAccessToken: props.getProperty('LINE_CHANNEL_ACCESS_TOKEN') || '',
-    lineTargetId: props.getProperty('LINE_TARGET_ID') || '',
-    reminderCount: Number(props.getProperty('REMINDER_COUNT') || DEFAULT_CONFIG.reminderCount),
-  };
-}
-
-function getSheet_(config) {
-  const spreadsheet = config.spreadsheetId ? SpreadsheetApp.openById(config.spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet && spreadsheet.getSheetByName(config.sheetName);
-  if (!sheet) throw new Error('找不到工作表：' + config.sheetName);
-  return sheet;
-}
-
-function findNextMeetingDate_(rows, fromDate, includeFromDate) {
-  const from = startOfDay_(fromDate).getTime();
-  const dates = rows.map(function (row) { return row.reportDate; }).filter(Boolean)
-    .filter(function (date) { return includeFromDate ? date.getTime() >= from : date.getTime() > from; })
-    .filter(function (date) { return !isMeetingSkipped_(date); })
-    .sort(function (a, b) { return a.getTime() - b.getTime(); });
-  return dates.length ? dates[0] : null;
-}
-
-function hasMeetingOn_(rows, date) {
-  return rows.some(function (row) { return row.reportDate && row.reportDate.getTime() === startOfDay_(date).getTime(); });
-}
-
-function parseSheetDate_(value) {
-  if (value instanceof Date && !isNaN(value.getTime())) return startOfDay_(value);
-  const match = String(value || '').match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const parsed = new Date(year, month - 1, day);
-  return parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day ? parsed : null;
-}
-
-function canSkipMeeting_(userId) {
-  const ids = (PropertiesService.getScriptProperties().getProperty('LINE_ADMIN_USER_IDS') || '')
-    .split(',').map(function (id) { return id.trim(); }).filter(Boolean);
-  return ids.length === 0 || ids.indexOf(userId) !== -1;
-}
-
-function getBoundMember_(source) {
-  return source && source.userId ? PropertiesService.getScriptProperties().getProperty(BOT_KEYS.bindingPrefix + source.userId) : null;
-}
-
-function rememberLineTarget_(source) {
-  const targetId = source && (source.groupId || source.roomId);
-  const props = PropertiesService.getScriptProperties();
-  if (targetId && !props.getProperty('LINE_TARGET_ID')) props.setProperty('LINE_TARGET_ID', targetId);
-}
-
-function isAllowedSource_(source) {
-  const configured = PropertiesService.getScriptProperties().getProperty('LINE_TARGET_ID');
-  const incoming = source && (source.groupId || source.roomId);
-  return !configured || !incoming || configured === incoming;
-}
-
-function notifyGroup_(source, text) {
-  const targetId = source && (source.groupId || source.roomId);
-  if (targetId) pushMessages_(Object.assign(getConfig_(), { lineTargetId: targetId }), [{ type: 'text', text: text }]);
-}
-
-function replyText_(replyToken, text) {
-  replyMessages_(replyToken, [{ type: 'text', text: text }]);
-}
-
-function replyMessages_(replyToken, messages) {
-  callLineApi_('/v2/bot/message/reply', { replyToken: replyToken, messages: messages });
-}
-
-function pushMessages_(config, messages) {
-  if (!config.lineTargetId) throw new Error('尚未取得群組 ID；請先把 Bot 加入群組並在群組輸入「說明」。');
-  callLineApi_('/v2/bot/message/push', { to: config.lineTargetId, messages: messages }, config);
-}
-
-function callLineApi_(path, payload, optionalConfig) {
-  const config = optionalConfig || getConfig_();
-  if (!config.lineChannelAccessToken) throw new Error('請先設定 LINE_CHANNEL_ACCESS_TOKEN。');
-  const response = UrlFetchApp.fetch('https://api.line.me' + path, {
-    method: 'post',
-    contentType: 'application/json; charset=UTF-8',
-    muteHttpExceptions: true,
-    headers: { Authorization: 'Bearer ' + config.lineChannelAccessToken },
-    payload: JSON.stringify(payload),
-  });
-  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
-    throw new Error('LINE API 失敗：' + response.getResponseCode() + ' ' + response.getContentText());
-  }
-}
-
-function parsePostback_(value) {
+function parseQuery_(value) {
   return String(value || '').split('&').reduce(function (result, part) {
     const pair = part.split('=');
     result[decodeURIComponent(pair[0])] = decodeURIComponent(pair.slice(1).join('=') || '');
@@ -564,25 +553,23 @@ function parsePostback_(value) {
   }, {});
 }
 
-function clearDeferred_(rowNumber) {
-  PropertiesService.getScriptProperties().deleteProperty(BOT_KEYS.deferredPrefix + rowNumber);
-}
-
-function isMeetingSkipped_(date) {
-  return PropertiesService.getScriptProperties().getProperty(BOT_KEYS.skippedPrefix + dateKey_(date)) === 'true';
+function isSkipped_(date) {
+  return getProperty_(KEYS.skippedPrefix + dateKey_(date)) === 'true';
 }
 
 function parseDateKey_(value) {
   const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  return match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : null;
+  return match ? makeDate_(Number(match[1]), Number(match[2]), Number(match[3]), 0, 0) : null;
 }
 
-function dateKey_(date) {
-  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+function makeDate_(year, month, day, hour, minute) {
+  if (!validTime_(hour, minute)) return null;
+  const date = new Date(year, month - 1, day, hour, minute);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day ? date : null;
 }
 
-function formatDate_(date) {
-  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+function validTime_(hour, minute) {
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
 }
 
 function startOfDay_(date) {
@@ -595,29 +582,75 @@ function addDays_(date, days) {
   return startOfDay_(result);
 }
 
-function normalizeStatus_(value) {
-  return String(value || '').trim().replace(/\s+/g, '').toLowerCase();
+function dateKey_(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
 
-function isCompletedStatus_(status) {
-  return ['已報告', '已完成', '完成', '已交', 'done'].indexOf(status) !== -1;
+function meetingKey_(date) {
+  return String(date.getTime());
 }
 
-function isLeaveStatus_(status) {
-  return ['請假', '休假', '補報告', '延期'].indexOf(status) !== -1;
+function formatDate_(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy/MM/dd');
 }
 
-function buildHelpText_() {
+function formatDateTime_(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm');
+}
+
+function pad_(value) {
+  return String(value).padStart(2, '0');
+}
+
+function getProperty_(key) {
+  return PropertiesService.getScriptProperties().getProperty(key);
+}
+
+function setProperty_(key, value) {
+  PropertiesService.getScriptProperties().setProperty(key, String(value));
+}
+
+function deleteProperty_(key) {
+  PropertiesService.getScriptProperties().deleteProperty(key);
+}
+
+function getJson_(key, fallback) {
+  const value = getProperty_(key);
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    console.error('Invalid JSON in ' + key);
+    return fallback;
+  }
+}
+
+function setJson_(key, value) {
+  setProperty_(key, JSON.stringify(value));
+}
+
+function withLock_(callback) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return callback();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function helpText_() {
   return [
-    '📖 報告輪值 Bot 指令',
-    '「綁定 姓名」：綁定 Sheet 裡的姓名',
-    '「輪值」：查看下一次報告人',
-    '「請假」：輪到自己時順延到下個開會週',
-    '「完成」：將自己的報告標記完成',
-    '「我的ID」：取得管理員設定需要的 User ID',
-    '管理員「啟用輪值 姓名」：加入指定人員',
-    '管理員「停用輪值 姓名」：暫停指定人員',
-    '「輪值名單」：查看目前參與人員',
-    '每天自動檢查，並在開會前一天提醒。',
+    '📖 PAPER CALL 指令',
+    '管理員：加入輪值 + 標註成員',
+    '管理員：移除輪值 + 標註成員',
+    '加入我輪值：自己加入',
+    '輪值名單：查看循環順序',
+    '設定週會 星期二 10:00',
+    '設定下次會議 2026/07/21 10:00',
+    '輪值：查看下次兩位報告人',
+    '請假：本次跳過，下個開會週優先補',
+    '完成：完成報告並排到隊尾',
+    '我的ID：查看 LINE User ID',
   ].join('\n');
 }

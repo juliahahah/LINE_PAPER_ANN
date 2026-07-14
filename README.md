@@ -1,131 +1,128 @@
-# LINE 群組報告輪值 Bot
+# PAPER CALL：純 LINE 群組報告輪值 Bot
 
-使用 Google Apps Script、Google Sheets 與 LINE Messaging API，無需另租伺服器。
+不使用 Google Sheet。指定成員、輪值順序、請假、停會及會議時間全部保存在 Google Apps Script 的 Script Properties，並直接在 LINE 群組操作。
 
 ## 功能
 
-- 每次從 Sheet 找出兩位尚未報告的人。
-- 開會前一天自動在 LINE 群組提醒。
-- 報告人可按「我要請假」，系統立即找下一位替補。
-- 請假者在下一個有開會的週次優先補報告。
-- 管理員可按「本週不開會」，該週不通知、不消耗名單。
-- 成員可在群組輸入「輪值」查看下一次報告人。
-- 成員可輸入「完成」更新 Sheet 狀態。
-- 管理員可從群組中特別指定哪些人參與輪值，不需要全員加入。
-- 自動偵測表頭位置，不要求表頭一定在第一列。
+- 管理員在群組輸入「加入輪值」並標註特定成員。
+- 只有被選中的人持續循環輪班，每次預設兩位。
+- 開會前一天自動在群組標註報告人。
+- 報告人可按「我要請假」，Bot 立即找下一位替補。
+- 請假者在下一個實際開會週優先補報告。
+- 管理員可按「本週不開會」，輪值順序完全保留。
+- 報告人按「完成報告」後移到輪值隊尾。
+- 支援固定每週會議與臨時指定下次會議。
 
-## Sheet 必要欄位
+## 需要準備
 
-欄位名稱需包含：
+1. LINE Official Account。
+2. LINE Developers 的 Messaging API Channel；LINE Login Channel 不能用來傳 Bot 訊息。
+3. Messaging API Channel Access Token。
+4. Google Apps Script 專案與部署後的 Webhook URL。
 
-- 報告日期
-- 報告人
-- 報告主題
-- 狀態
-- 結果（名稱可以是「結果（自動）」）
+不需要 Google Sheet、資料庫或額外伺服器。
 
-狀態請使用「未報告」、「已報告」或「請假」。報告日期欄中的日期視為開會日期；同一天可有兩位。
+## 1. LINE Messaging API 設定
 
-## 1. 建立 LINE 官方帳號與 Messaging API
-
-1. 到 LINE Official Account Manager 建立官方帳號。
-2. 到 LINE Developers 建立 Messaging API Channel。
-3. 開啟「Allow bot to join group chats」。
-4. 發行長效 Channel Access Token。
-5. 關閉 LINE 官方帳號內建的自動回應，避免一則訊息回覆兩次。
+1. 到 LINE Official Account Manager 建立或開啟官方帳號。
+2. 在設定中啟用 Messaging API，Provider 選擇自己的 Provider。
+3. 回 LINE Developers，開啟新產生的 Messaging API Channel。
+4. 在 Messaging API 分頁開啟 `Allow bot to join group chats`。
+5. 發行 Channel Access Token。
+6. 關閉官方帳號內建的自動回應，避免重複回覆。
 
 ## 2. 建立 Apps Script
 
-1. 從目標 Google Sheet 點「擴充功能 → Apps Script」。
-2. 將 [Code.gs](Code.gs) 的內容貼入。
-3. 在專案設定開啟「顯示 appsscript.json」，再貼入 [appsscript.json](appsscript.json)。
+1. 到 https://script.google.com 建立「獨立 Apps Script 專案」。
+2. 將 [Code.gs](Code.gs) 內容貼入編輯器。
+3. 在專案設定開啟顯示資訊清單，將 [appsscript.json](appsscript.json) 內容貼入。
 4. 在「專案設定 → 指令碼屬性」新增：
 
-| 屬性 | 必填 | 值 |
+| 屬性 | 必填 | 說明 |
 |---|---:|---|
-| `LINE_CHANNEL_ACCESS_TOKEN` | 是 | LINE Developers 發行的長效 Token |
-| `SHEET_NAME` | 是 | 實際分頁名稱；程式預設為「報告輪值表」 |
-| `WEBHOOK_SECRET` | 是 | 自訂一段無法猜到的隨機字串，例如密碼產生器產生的 32 字元字串 |
-| `SPREADSHEET_ID` | 否 | 已預填目前網址中的 Sheet ID |
-| `REMINDER_COUNT` | 否 | 每週人數，預設 `2` |
-| `LINE_ADMIN_USER_IDS` | 建議 | 可按 SKIP 的 User ID；多人用逗號分隔 |
+| `LINE_CHANNEL_ACCESS_TOKEN` | 是 | Messaging API 分頁發行的 Token |
+| `WEBHOOK_SECRET` | 否 | 自訂隨機字串；若設定，Webhook URL 必須加相同 `?key=` |
+| `LINE_ADMIN_USER_IDS` | 否 | 可先不填，之後用「初始化管理員」設定第一位管理員 |
+| `REMINDER_COUNT` | 否 | 每次報告人數，預設 `2`，最大 `10` |
 
-若未設定 `LINE_ADMIN_USER_IDS`，群組中任何人都能按「本週不開會」。
+Token 只放 Script Properties，不要寫進程式或 GitHub。
 
 ## 3. 部署 Webhook
 
-1. Apps Script 點「部署 → 新部署 → 網頁應用程式」。
-2. 執行身分選「我」。
-3. 存取權選「所有人」。
-4. 複製部署完成的 `/exec` 網址。
-5. 在網址後加上 `?key=你的WEBHOOK_SECRET`，例如 `https://script.google.com/macros/s/部署ID/exec?key=隨機字串`。
-6. 將完整網址貼到 LINE Developers 的 Webhook URL，開啟 Use webhook，再按 Verify。
-7. 每次修改程式後，要到「管理部署 → 編輯 → 新版本」重新部署。
+1. Apps Script 點「部署 → 新部署」。
+2. 類型選「網頁應用程式」。
+3. 執行身分選「我」。
+4. 存取權選「所有人」。
+5. 部署後複製 `/exec` 網址。
+6. 如果有設定 `WEBHOOK_SECRET`，在網址後加 `?key=相同字串`。
+7. 把完整網址貼到 LINE Developers → Messaging API → Webhook URL。
+8. 按 Verify，成功後開啟 Use webhook。
+9. 程式修改後需「管理部署 → 編輯 → 新版本」重新部署。
 
-> Apps Script 無法直接讀取 LINE 的 `X-Line-Signature` HTTP Header，因此此版本用不可猜測的 URL 密鑰保護 Webhook。密鑰不要公開或提交到 GitHub。
+## 4. 加入群組與初始化
 
-## 4. 設定每天檢查
+1. 將 LINE 官方帳號邀請到目標群組。
+2. 第一位管理員在群組輸入：`初始化管理員`。
+3. Bot 會記住第一個使用它的群組，其他群組無法操作同一個專案。
+4. 管理員輸入「加入輪值」，並在同一則訊息中標註要加入的人。
+5. 可一次標註多人；Bot 會依加入順序建立循環隊列。
+
+如果已在 Script Properties 填入 `LINE_ADMIN_USER_IDS`，不需要執行初始化管理員。可在群組輸入「我的ID」取得 User ID。
+
+## 5. 設定會議
+
+固定每週開會：
+
+- `設定週會 星期二 10:00`
+- `設定週會 週五 14:30`
+
+臨時指定下一次會議，這個日期會優先於較晚的固定週會：
+
+- `設定下次會議 2026/07/21 10:00`
+
+## 6. 設定前一天自動提醒
 
 在 Apps Script 左側「觸發條件」新增：
 
 - 執行函式：`sendDailyReminder`
 - 事件來源：時間驅動
 - 類型：日計時器
-- 時段：例如上午 9–10 點
+- 執行時段：例如每天上午 9–10 點
 
-程式每天檢查明天是否有 Sheet 中的開會日期；只有開會前一天才傳提醒。
+只有當「明天是會議日」時才會發送提醒，同一天不會重複發送。
 
-## 5. 加入 LINE 群組並初始化
+## LINE 群組指令
 
-1. 把官方帳號邀進目標 LINE 群組。
-2. 在群組輸入「說明」。Bot 會自動記住該群組 ID，無需手動尋找。
-3. 每位成員輸入「綁定 Sheet姓名」，例如：`綁定 Julia_Liu`。
-4. 管理員輸入「我的ID」，把 Bot 回覆的 ID 填入 Script Property `LINE_ADMIN_USER_IDS`。
-5. 管理員輸入「啟用輪值 姓名」逐一選擇要參與的人，例如：`啟用輪值 Julia_Liu`。
-6. 輸入「輪值名單」檢查指定的人員，再輸入「輪值」查看下一次兩位報告人。
+| 指令 | 誰可以用 | 功能 |
+|---|---|---|
+| `初始化管理員` | 首位設定者 | 尚無管理員時，將自己設為管理員 |
+| `加入輪值` + 標註成員 | 管理員 | 將特定群組成員加入循環 |
+| `移除輪值` + 標註成員 | 管理員 | 從循環移除成員 |
+| `加入我輪值` | 所有人 | 將自己加入循環 |
+| `輪值名單` | 所有人 | 查看目前完整輪值順序 |
+| `輪值` | 所有人 | 查看下一次會議與報告人 |
+| `設定週會 星期二 10:00` | 管理員 | 設定固定每週會議 |
+| `設定下次會議 2026/07/21 10:00` | 管理員 | 設定一次性下次會議 |
+| `請假` | 本次報告人 | 本次找人替補，下個開會週優先補 |
+| `完成` | 本次報告人 | 標記完成並移到隊尾 |
+| `我的ID` | 所有人 | 顯示自己的 LINE User ID |
+| `說明` | 所有人 | 顯示指令摘要 |
 
-## 群組操作
+提醒訊息也會提供「我要請假」、「完成報告」和「本週不開會」按鈕。
 
-- `綁定 姓名`：將自己的 LINE 帳號對應到 Sheet 姓名。
-- `輪值`：顯示下一次開會日期及兩位報告人。
-- `請假` 或「我要請假」按鈕：只有本次報告人能成功請假。
-- `完成` 或「完成報告」按鈕：將本人第一筆未完成報告設為已報告。
-- 「本週不開會」：二次確認後跳過該開會日，名單留到下次。
-- `啟用輪值 姓名`：管理員把 Sheet 中的特定人員加入輪值；第一次使用時切換成指定名單模式。
-- `停用輪值 姓名`：管理員暫停特定人員。
-- `輪值名單`：查看目前參與輪值的人員。
-- `我的ID`：取得設定 `LINE_ADMIN_USER_IDS` 所需的 LINE User ID。
+## 建議首次測試
 
-## 你需要準備哪些東西
+1. 管理員初始化。
+2. 加入至少三位輪值成員。
+3. 輸入 `設定下次會議`，日期設為明天。
+4. 輸入 `輪值`，確認 Bot 標註前兩位。
+5. 其中一位按「我要請假」，確認第三位立即替補。
+6. 再輸入 `輪值`，確認更新後名單。
+7. 執行 `sendDailyReminder()`，確認群組收到前一天提醒。
+8. 按「本週不開會」，再執行提醒函式，確認不會再次通知。
 
-### 不需要傳給程式作者、由你自己貼進 Script Properties
+## GitHub
 
-1. **LINE Channel Access Token**
-	- LINE Developers → 你的 Provider → Messaging API Channel → Messaging API 分頁。
-	- 找到 Channel access token，按 Issue。
-	- 貼到 `LINE_CHANNEL_ACCESS_TOKEN`。這是密鑰，不要傳到群組或提交 GitHub。
-2. **WEBHOOK_SECRET**
-	- 用密碼產生器建立至少 32 字元的隨機字串。
-	- 同一字串放入 Script Property，並加在 Webhook URL 的 `?key=` 後面。
-3. **LINE 管理員 User ID**
-	- Bot 部署成功後，在群組輸入「我的ID」。
-	- 將回覆值填入 `LINE_ADMIN_USER_IDS`；多位管理員以逗號分隔。
+原始碼位於：https://github.com/juliahahah/LINE_PAPER_ANN
 
-### 已經具備或可自動取得
-
-- Google Sheet ID：已由你提供的網址預填為 `1ncJnbfJXqyWPDPKmtAMgC91Gg_p-_mjnsRO9r-3Jl-4`。
-- LINE 群組 ID：Bot 加入群組後，第一次收到群組指令會自動記錄。
-- Webhook URL：由 Apps Script「部署為網頁應用程式」後產生，不是從 LINE 取得。
-- GitHub 倉庫：專案原始碼推送到 `https://github.com/juliahahah/LINE_PAPER_ANN.git`；所有密鑰都不會放入倉庫。
-
-## 首次測試
-
-1. 確認 Sheet 中有一個明天的開會日期。
-2. 在 Apps Script 手動執行一次 `sendDailyReminder()` 並授權。
-3. 群組應收到明日報告提醒與按鈕。
-4. 用其中一位已綁定成員按「我要請假」，確認 Sheet 變成「請假」，群組名單自動補下一位。
-5. 按「本週不開會」確認後，再執行 `sendDailyReminder()`，不應再次發送。
-
-## 注意
-
-LINE Push Message 會計入官方帳號每月訊息額度。一般每週一次的單一群組提醒，用量通常很低。Script Properties 內的 Token 不要貼到群組或公開儲存庫。
+所有群組資料與 Token 都存在 Apps Script，不會提交到 GitHub。
