@@ -203,17 +203,25 @@ function setNextMeeting_(event, text) {
 }
 
 function sendDailyReminder() {
+  sendReminder_(false);
+}
+
+function sendTestReminder() {
+  sendReminder_(true);
+}
+
+function sendReminder_(repeatForTesting) {
   withLock_(function () {
     const meeting = findNextMeeting_(new Date());
     if (!meeting) return;
     const tomorrow = addDays_(startOfDay_(new Date()), 1);
     if (startOfDay_(meeting).getTime() !== tomorrow.getTime()) return;
     const sentKey = KEYS.sentPrefix + meetingKey_(meeting);
-    if (getProperty_(sentKey)) return;
+    if (!repeatForTesting && getProperty_(sentKey)) return;
     const assignment = getOrCreateAssignment_(meeting);
     if (!assignment.length) return;
     pushMessages_([buildRotationMessage_(meeting, assignment, true)]);
-    setProperty_(sentKey, new Date().toISOString());
+    if (!repeatForTesting) setProperty_(sentKey, new Date().toISOString());
   });
 }
 
@@ -667,5 +675,6 @@ function helpText_() {
     '管理員：幫請假 + 標註本次報告人',
     '完成：完成報告並排到隊尾',
     '我的ID：查看 LINE User ID',
+    '測試提醒：Apps Script 觸發器選 sendTestReminder',
   ].join('\n');
 }
