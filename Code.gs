@@ -68,6 +68,7 @@ function handleEvent_(event) {
   else if (/^設定下次會議\s+/.test(text)) setNextMeeting_(event, text);
   else if (/^(輪值|本週報告|下一位)$/.test(text)) replyCurrentRotation_(event.replyToken);
   else if (text === '請假') requestLeave_(event);
+  else if (/^幫請假/.test(text)) requestLeaveForMentionedMember_(event);
   else if (text === '完成') completeReport_(event);
   else if (/^(說明|help|幫助)$/i.test(text)) replyText_(event.replyToken, helpText_());
 }
@@ -226,8 +227,21 @@ function replyCurrentRotation_(replyToken) {
 }
 
 function requestLeave_(event) {
+  requestLeaveForUser_(event, event.source.userId);
+}
+
+function requestLeaveForMentionedMember_(event) {
+  if (!requireAdmin_(event)) return;
+  const mentionees = getMentionedUsers_(event.message);
+  if (mentionees.length !== 1) {
+    replyText_(event.replyToken, '請輸入「幫請假」並標註一位本次報告人。');
+    return;
+  }
+  requestLeaveForUser_(event, mentionees[0].userId);
+}
+
+function requestLeaveForUser_(event, userId) {
   withLock_(function () {
-    const userId = event.source.userId;
     const meeting = findNextMeeting_(new Date());
     if (!meeting) {
       replyText_(event.replyToken, '目前沒有即將到來的會議。');
@@ -650,6 +664,7 @@ function helpText_() {
     '設定下次會議 2026/07/21 10:00',
     '輪值：查看下次兩位報告人',
     '請假：本次跳過，下個開會週優先補',
+    '管理員：幫請假 + 標註本次報告人',
     '完成：完成報告並排到隊尾',
     '我的ID：查看 LINE User ID',
   ].join('\n');
