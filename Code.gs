@@ -66,6 +66,7 @@ function handleEvent_(event) {
   else if (text === '輪值名單') replyRoster_(event);
   else if (/^設定週會\s+/.test(text)) setWeeklyMeeting_(event, text);
   else if (/^設定下次會議\s+/.test(text)) setNextMeeting_(event, text);
+  else if (/^設定報告人數\s+/.test(text)) setReminderCount_(event, text);
   else if (/^(輪值|本週報告|下一位)$/.test(text)) replyCurrentRotation_(event.replyToken);
   else if (text === '請假') requestLeave_(event);
   else if (/^幫請假/.test(text)) requestLeaveForMentionedMember_(event);
@@ -202,6 +203,21 @@ function setNextMeeting_(event, text) {
   });
 }
 
+function setReminderCount_(event, text) {
+  if (!requireAdmin_(event)) return;
+  const match = text.match(/^設定報告人數\s+([12])$/);
+  if (!match) {
+    replyText_(event.replyToken, '格式：設定報告人數 1 或 設定報告人數 2');
+    return;
+  }
+  withLock_(function () {
+    const count = Number(match[1]);
+    setProperty_('REMINDER_COUNT', count);
+    clearFutureAssignments_();
+    replyText_(event.replyToken, '之後每次會安排 ' + count + ' 位報告人。');
+  });
+}
+
 function sendDailyReminder() {
   sendReminder_(false);
 }
@@ -300,10 +316,30 @@ function handlePostback_(event) {
   const data = parseQuery_(event.postback.data);
   if (data.action === 'leave') requestLeave_(event);
   else if (data.action === 'complete') completeReport_(event);
+  else if (data.action === 'one_presenter') reduceNextAssignmentToOne_(event, data.date);
   else if (data.action === 'skip_prompt') {
     if (!requireAdmin_(event)) return;
     replyMessages_(event.replyToken, [skipConfirmation_(data.date)]);
   } else if (data.action === 'skip_confirm') skipMeeting_(event, data.date);
+}
+
+function reduceNextAssignmentToOne_(event, dateValue) {
+  if (!requireAdmin_(event)) return;
+  withLock_(function () {
+    const meeting = findNextMeeting_(new Date());
+    if (!meeting || dateKey_(meeting) !== dateValue) {
+      replyText_(event.replyToken, '找不到這次即將到來的會議。');
+      return;
+    }
+    const assignment = getOrCreateAssignment_(meeting);
+    if (assignment.length <= 1) {
+      replyText_(event.replyToken, '這次會議目前已是單人報告。');
+      return;
+    }
+    const singlePresenter = assignment.slice(0, 1);
+    setAssignment_(meeting, singlePresenter);
+    replyText_(event.replyToken, '本次已改為單人報告：' + memberName_(singlePresenter[0]) + '。');
+  });
 }
 
 function skipMeeting_(event, dateValue) {
@@ -393,6 +429,7 @@ function buildRotationMessage_(meeting, userIds, isReminder) {
       items: [
         quickPostback_('🙋 我要請假', 'action=leave'),
         quickPostback_('✅ 完成報告', 'action=complete'),
+        quickPostback_('👤 本次一人報告', 'action=one_presenter&date=' + dateKey_(meeting)),
         quickPostback_('⏭️ 本週不開會', 'action=skip_prompt&date=' + dateKey_(meeting)),
       ],
     },
@@ -670,10 +707,12 @@ function helpText_() {
     '輪值名單：查看循環順序',
     '設定週會 星期二 10:00',
     '設定下次會議 2026/07/21 10:00',
+    '管理員：設定報告人數 1 或 2',
     '輪值：查看下次兩位報告人',
     '請假：本次跳過，下個開會週優先補',
     '管理員：幫請假 + 標註本次報告人',
     '完成：完成報告並排到隊尾',
+    '管理員可按「本次一人報告」只調整下一場會議',
     '我的ID：查看 LINE User ID',
     '測試提醒：Apps Script 觸發器選 sendTestReminder',
   ].join('\n');
