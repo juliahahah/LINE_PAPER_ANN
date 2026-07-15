@@ -1,5 +1,3 @@
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-
 export default {
   async fetch(request, env, context) {
     if (request.method === 'GET') {
@@ -28,21 +26,11 @@ export default {
         redirect: 'manual',
       });
 
-      let finalResponse = firstResponse;
-      if (REDIRECT_STATUSES.has(firstResponse.status)) {
-        const location = firstResponse.headers.get('location');
-        if (!location) throw new Error('Apps Script redirect did not include a Location header.');
-        finalResponse = await fetch(location, {
-          method: 'POST',
-          headers,
-          body: body.slice(0),
-          redirect: 'follow',
-        });
-      }
-
-      if (!finalResponse.ok) {
-        const errorText = await finalResponse.text();
-        console.error('Apps Script error', finalResponse.status, errorText);
+      // Apps Script runs doPost() before it returns its unavoidable 302 redirect.
+      // The redirect only serves the response body and must not receive the event again.
+      if (!firstResponse.ok && firstResponse.status !== 302) {
+        const errorText = await firstResponse.text();
+        console.error('Apps Script error', firstResponse.status, errorText);
         return new Response('Upstream error', { status: 502 });
       }
 

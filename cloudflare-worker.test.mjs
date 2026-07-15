@@ -29,9 +29,7 @@ const response = await worker.fetch(request, {
 
 assert.equal(response.status, 200);
 assert.equal(await response.text(), 'OK');
-assert.equal(calls.length, 2);
+assert.equal(calls.length, 1);
 assert.equal(calls[0].method, 'POST');
 assert.equal(calls[0].redirect, 'manual');
-assert.equal(calls[1].method, 'POST');
-assert.equal(calls[1].url, 'https://script.googleusercontent.com/test');
-console.log('Worker redirect proxy test: OK');
+console.log('Worker Apps Script redirect test: OK');

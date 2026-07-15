@@ -60,7 +60,7 @@ Token 只放 Script Properties，不要寫進程式或 GitHub。
 
 ## 4. 部署 Webhook 代理
 
-LINE Verify 不接受 Google Apps Script 固定產生的 `302` 轉址，因此不能把 `/exec` 網址直接填入 LINE。使用免費 Cloudflare Worker 將回應轉成直接的 `200 OK`：
+LINE Verify 不接受 Google Apps Script 固定產生的 `302` 轉址，因此不能把 `/exec` 網址直接填入 LINE。使用免費 Cloudflare Worker 將 Apps Script 已處理完成的 `302` 回應轉成直接的 `200 OK`：
 
 1. 登入 https://dash.cloudflare.com 。
 2. 選擇「Workers & Pages → Create → Worker」。
